@@ -38,7 +38,6 @@ if __name__ == '__main__':
         delta = end - start
         print('Similarity timing for top %s model terms.' % (str(_n)))
         print('Finding top %s most similar terms for each model term.' % (str(num_most_sim)))
-        print('%s similarity calculations.' % (str(_n * num_most_sim)))
         print('Completed in %s seconds.' % (str(delta)))
         print('----------------------------------------------------------\n')
 
