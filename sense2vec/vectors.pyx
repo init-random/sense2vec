@@ -4,7 +4,7 @@
 cimport cython.parallel
 from libc.stdint cimport int32_t
 from libc.stdint cimport uint64_t
-from libc.string cimport memcpy
+from libc.string cimport memcpy, memset
 from libcpp.pair cimport pair
 from libcpp.queue cimport priority_queue
 from libcpp.vector cimport vector
@@ -13,8 +13,10 @@ from preshed.maps cimport PreshMap
 from spacy.strings cimport StringStore, hash_string
 from murmurhash.mrmr cimport hash64
 
+cimport posix.stdlib
 from cymem.cymem cimport Pool
 cimport numpy as np
+from libc.math cimport sqrt
 import numpy
 from os import path
 try:
@@ -25,8 +27,6 @@ except ImportError:
 
 ctypedef pair[float, int] Entry
 ctypedef priority_queue[Entry] Queue
-ctypedef float (*do_similarity_t)(const float* v1, const float* v2,
-        float nrm1, float nrm2, int nr_dim) nogil
 
 
 cdef struct _CachedResult:
@@ -122,13 +122,16 @@ cdef class VectorStore:
     cdef readonly PreshMap cache
     cdef vector[float*] vectors
     cdef vector[float] norms
-    cdef vector[float] _similarities
     cdef readonly int nr_dim
     
     def __init__(self, int nr_dim):
         self.mem = Pool()
         self.nr_dim = nr_dim 
-        zeros = <float*>self.mem.alloc(self.nr_dim, sizeof(float))
+
+        cdef aligned_allocator mem
+        cdef float* zeros = mem.allocate(self.nr_dim)
+        memset(zeros, 0, self.nr_dim * sizeof(float))
+
         self.vectors.push_back(zeros)
         self.norms.push_back(0)
         self.cache = PreshMap(100000)
@@ -140,9 +143,11 @@ cdef class VectorStore:
 
     def add(self, float[:] vec):
         assert len(vec) == self.nr_dim
-        ptr = <float*>self.mem.alloc(self.nr_dim, sizeof(float))
-        memcpy(ptr,
-            &vec[0], sizeof(ptr[0]) * self.nr_dim)
+
+        cdef aligned_allocator mem
+        cdef float* ptr = mem.allocate(self.nr_dim)
+
+        memcpy(ptr, &vec[0], sizeof(ptr[0]) * self.nr_dim)
         self.norms.push_back(get_l2_norm(&ptr[0], self.nr_dim))
         self.vectors.push_back(ptr)
     
@@ -167,11 +172,7 @@ cdef class VectorStore:
                 if cached_result.scores is not NULL:
                     self.mem.free(cached_result.scores)
                 self.mem.free(cached_result)
-            self._similarities.resize(self.vectors.size())
-            linear_similarity(&indices[0], &scores[0], &self._similarities[0],
-                n, &query[0], self.nr_dim,
-                &self.vectors[0], &self.norms[0], self.vectors.size(), 
-                cosine_similarity)
+            self.linear_similarity(indices, scores, n, query, self.nr_dim)
             cached_result = <_CachedResult*>self.mem.alloc(sizeof(_CachedResult), 1)
             cached_result.n = n
             cached_result.indices = <int*>self.mem.alloc(
@@ -210,51 +211,83 @@ cdef class VectorStore:
         cfile.close()
 
 
-cdef void linear_similarity(int* indices, float* scores, float* tmp,
-        int nr_out, const float* query, int nr_dim,
-        const float* const* vectors, const float* norms, int nr_vector,
-        do_similarity_t get_similarity) nogil:
-    query_norm = get_l2_norm(query, nr_dim)
-    # Initialize the partially sorted heap
-    cdef int i
-    cdef float score
-    for i in cython.parallel.prange(nr_vector, nogil=True):
-        #tmp[i] = cblas_sdot(nr_dim, query, 1, vectors[i], 1) / (query_norm * norms[i])
-        tmp[i] = get_similarity(query, vectors[i], query_norm, norms[i], nr_dim)
-    cdef priority_queue[pair[float, int]] queue
-    cdef float cutoff = 0
-    for i in range(nr_vector):
-        score = tmp[i]
-        if score > cutoff:
-            queue.push(pair[float, int](-score, i))
-            cutoff = -queue.top().first
-            if queue.size() > nr_out:
-                queue.pop()
-    # Fill the outputs
-    i = 0
-    while i < nr_out and not queue.empty(): 
-        entry = queue.top()
-        scores[nr_out-(i+1)] = -entry.first
-        indices[nr_out-(i+1)] = entry.second
-        queue.pop()
-        i += 1
+    def linear_similarity(self, int[:] indices, float[:] scores,
+            int nr_out, float[:] query, int nr_dim):
+
+        query_norm = get_l2_norm(&query[0], nr_dim)
+
+        cdef vector[float] scores_tmp
+        scores_tmp.resize(self.vectors.size())
+
+        cdef int i
+        for i in cython.parallel.prange(self.vectors.size(), nogil=True):
+            scores_tmp[i] = cosine_similarity(&query[0], (&self.vectors[0])[i], query_norm, (&self.norms[0])[i], nr_dim)
+
+        # Initialize the partially sorted heap
+        cdef float score
+        cdef priority_queue[pair[float, int]] queue
+        cdef float cutoff = 0
+        for i in range(scores_tmp.size()):
+            score = scores_tmp[i]
+            if score > cutoff:
+                queue.push(pair[float, int](-score, i))
+                cutoff = -queue.top().first
+                if queue.size() > nr_out:
+                    queue.pop()
+
+        # Fill the outputs
+        i = 0
+        while i < nr_out and not queue.empty():
+            entry = queue.top()
+            scores[nr_out-(i+1)] = -entry.first
+            indices[nr_out-(i+1)] = entry.second
+            queue.pop()
+            i += 1
 
 
-cdef extern from "cblas_shim.h":
-    float cblas_sdot(int N, float  *x, int incX, float  *y, int incY ) nogil
-    float cblas_snrm2(int N, float  *x, int incX) nogil
-    int _use_blas()
+cdef extern from "<simdpp/simd.h>":
+    int SIMDPP_FAST_FLOAT32_SIZE
 
 
-cpdef bint use_blas():
-    return _use_blas()
+cdef extern from "<simdpp/simd.h>" namespace "simdpp":
+    cppclass float32[SIMDPP_FAST_FLOAT32_SIZE]:
+        float32() nogil
+
+    cppclass aligned_allocator "simdpp::aligned_allocator<float, 32>":
+        float* allocate(int)
+
+    float32 mul(float32, float32) nogil
+    float32 add(float32, float32) nogil
+    float32 load(void*) nogil
+    float reduce_add(float32) nogil
+    float32 make_float(double, double, double, double) nogil
 
 
 cdef float get_l2_norm(const float* vec, int n) nogil:
-    return cblas_snrm2(n, vec, 1)
+
+    cdef float32 x
+    cdef float32 z = make_float(0, 0, 0, 0)
+
+    cdef int i = 0
+    while i < n:
+        x = load(&vec[i])
+        z = add(mul(x, x), z)
+        i += SIMDPP_FAST_FLOAT32_SIZE
+
+    return sqrt(reduce_add(z))
 
 
 cdef float cosine_similarity(const float* v1, const float* v2,
-        float norm1, float norm2, int n) nogil:
-    cdef float dot = cblas_sdot(n, v1, 1, v2, 1)
-    return dot / (norm1 * norm2)
+                             float norm1, float norm2, int n) nogil:
+
+    cdef float32 x
+    cdef float32 z = make_float(0, 0, 0, 0)
+
+    cdef int i = 0
+    while i < n:
+        x = load(&v1[i])
+        y = load(&v2[i])
+        z = add(mul(x, y), z)
+        i += SIMDPP_FAST_FLOAT32_SIZE
+
+    return reduce_add(z) / (norm1 * norm2)

@@ -7,6 +7,7 @@ import sys
 import contextlib
 from distutils.command.build_ext import build_ext
 from distutils.sysconfig import get_python_inc
+from distutils.ccompiler import get_default_compiler
 
 try:
     from setuptools import Extension, setup
@@ -30,20 +31,20 @@ MOD_NAMES = [
 # By subclassing build_extensions we have the actual compiler that will be used which is really known only after finalize_options
 # http://stackoverflow.com/questions/724664/python-distutils-how-to-get-a-compiler-that-is-going-to-be-used
 compile_options =  {'msvc'  : ['/Ox', '/EHsc'],
-                    'other' : ['-O3', '-Wno-unused-function',
+                    'other' : ['-O3',
+                               '-Wno-unused-function',
                                '-fno-stack-protector']}
 link_options    =  {'msvc'  : [],
                     'other' : ['-fno-stack-protector']}
 
 
-if os.environ.get('USE_BLAS') == '1':
+if sys.platform.startswith('darwin'):
     compile_options['other'].extend([
-        '-DUSE_BLAS=1',
-        '-fopenmp'])
-    link_options['other'].extend([
-        '-fopenmp',
-        '-L/usr/lib64/atlas',  # needed for redhat
-        '-lcblas'])
+        '-stdlib=libc++',
+        '-mmacosx-version-min=10.7'])
+else:
+    compile_options['other'].append('-fopenmp')
+    link_options['other'].append('-fopenmp')
 
 
 class build_ext_subclass(build_ext):
@@ -55,11 +56,11 @@ class build_ext_subclass(build_ext):
         #             mod_name, os.path.relpath(mod.get_include(), mod.__path__[0])))
 
         for e in self.extensions:
-            e.extra_compile_args = compile_options.get(
-                self.compiler.compiler_type, compile_options['other'])
+            e.extra_compile_args.extend(compile_options.get(
+                self.compiler.compiler_type, compile_options['other']))
         for e in self.extensions:
-            e.extra_link_args = link_options.get(
-                self.compiler.compiler_type, link_options['other'])
+            e.extra_link_args.extend(link_options.get(
+                self.compiler.compiler_type, link_options['other']))
         build_ext.build_extensions(self)
 
 
@@ -119,6 +120,14 @@ def setup_package():
         with open(os.path.join(root, 'README.rst')) as f:
             readme = f.read()
 
+        with open(os.path.join(root, 'sense2vec', 'cpuinfo.py')) as f:
+            cpuinfo = {}
+            exec(f.read(), cpuinfo)
+
+        with open(os.path.join(root, 'sense2vec', 'arch.py')) as f:
+            arch = {}
+            exec(f.read(), arch)
+
         include_dirs = [
             get_python_inc(plat_specific=True),
             os.path.join(root, 'include')]
@@ -126,9 +135,21 @@ def setup_package():
         ext_modules = []
         for mod_name in MOD_NAMES:
             mod_path = mod_name.replace('.', '/') + '.cpp'
-            ext_modules.append(
-                Extension(mod_name, [mod_path],
-                    language='c++', include_dirs=include_dirs))
+
+            flags = cpuinfo['get_cpu_info']()['flags']
+            supported_archs = arch['get_supported_mapping'](flags)
+
+            for flag, (define, option) in supported_archs.items():
+                ext_args = {
+                    'language':'c++',
+                    'include_dirs': include_dirs}
+                if define:
+                    ext_args['define_macros'] = [(define, None)]
+                if option and get_default_compiler() == 'unix':
+                    ext_args['extra_compile_args'] = [option]
+
+                ext_modules.append(
+                    Extension(mod_name, [mod_path], **ext_args))
 
         if not is_source_release(root):
             generate_cython(root, src_path)
@@ -147,7 +168,8 @@ def setup_package():
             license=about['__license__'],
             ext_modules=ext_modules,
             install_requires=[
-                'numpy>=1.7',
+                'numpy<1.11',
+                'ujson>=1.34',
                 'spacy>=0.100,<0.101',
                 'preshed>=0.46,<0.47',
                 'murmurhash>=0.26,<0.27',
